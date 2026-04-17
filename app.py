@@ -37,7 +37,6 @@ ENRICHMENT_COLUMNS = [
     "api_tel_2",
 ]
 
-
 ABBREVIATIONS = {
     "AVENUE": "AV",
     "BOULEVARD": "BD",
@@ -85,26 +84,26 @@ def normalize_address(text: str) -> str:
     text = normalize_text(text)
     text = re.sub(r"\b(BP|CS)\s*\d+\b", " ", text)
 
-    words = []
+    parts = []
     for word in text.split():
         if word in STOP_WORDS:
             continue
-        words.append(ABBREVIATIONS.get(word, word))
+        parts.append(ABBREVIATIONS.get(word, word))
 
-    return re.sub(r"\s+", " ", " ".join(words)).strip()
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
 
 
-def extract_cp_city(cp_ville: str) -> Tuple[str, str]:
-    cp_ville = normalize_text(cp_ville)
-    match = re.match(r"^(\d{5})\s+(.*)$", cp_ville)
+def extract_cp_city(value: str) -> Tuple[str, str]:
+    value = normalize_text(value)
+    match = re.match(r"^(\d{5})\s+(.*)$", value)
     if not match:
-        return "", cp_ville
+        return "", value
 
     cp = match.group(1)
-    ville = match.group(2).strip()
-    ville = re.sub(r"\bCEDEX\b\s*\d*", "", ville).strip()
-    ville = re.sub(r"\s+", " ", ville)
-    return cp, ville
+    city = match.group(2).strip()
+    city = re.sub(r"\bCEDEX\b\s*\d*", "", city).strip()
+    city = re.sub(r"\s+", " ", city)
+    return cp, city
 
 
 def similarity(a: str, b: str) -> float:
@@ -114,37 +113,38 @@ def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
-def build_input_address(row: pd.Series) -> str:
+def source_address(row: pd.Series) -> str:
     rue = clean_str(row.get("Rue complète"))
     cp_ville = clean_str(row.get("CP-Ville"))
     return " ".join(x for x in [rue, cp_ville] if x).strip()
+
+
+def search_query(row: pd.Series) -> str:
+    return clean_str(row.get("Intitulé"))
 
 
 def is_france_or_unspecified(country: Any) -> bool:
     country = clean_str(country)
     if not country:
         return True
-
-    norm = normalize_text(country)
-    return norm in {"FRANCE", "FR", "FRA"}
+    return normalize_text(country) in {"FRANCE", "FR", "FRA"}
 
 
-def get_nested(d: Dict[str, Any], *keys, default=None):
-    cur = d
+def get_nested(data: Dict[str, Any], *keys, default=None):
+    current = data
     for key in keys:
-        if not isinstance(cur, dict):
+        if not isinstance(current, dict):
             return default
-        cur = cur.get(key)
-        if cur is None:
+        current = current.get(key)
+        if current is None:
             return default
-    return cur
+    return current
 
 
 def compute_french_vat_from_siren(siren: str) -> Optional[str]:
     siren = re.sub(r"\D", "", clean_str(siren))
     if len(siren) != 9:
         return None
-
     key = (12 + 3 * (int(siren) % 97)) % 97
     return f"FR{key:02d}{siren}"
 
@@ -152,10 +152,10 @@ def compute_french_vat_from_siren(siren: str) -> Optional[str]:
 class RechercheEntrepriseClient:
     def __init__(self):
         self.session = requests.Session()
-        self._last_call_ts = 0.0
+        self.last_call = 0.0
 
-    def _throttle(self):
-        elapsed = time.time() - self._last_call_ts
+    def throttle(self):
+        elapsed = time.time() - self.last_call
         if elapsed < MIN_DELAY_BETWEEN_CALLS:
             time.sleep(MIN_DELAY_BETWEEN_CALLS - elapsed)
 
@@ -174,9 +174,9 @@ class RechercheEntrepriseClient:
 
         for attempt in range(max_retries + 1):
             try:
-                self._throttle()
+                self.throttle()
                 response = self.session.get(API_URL, params=params, timeout=10)
-                self._last_call_ts = time.time()
+                self.last_call = time.time()
 
                 if response.status_code == 200:
                     return response.json()
@@ -200,23 +200,6 @@ class RechercheEntrepriseClient:
         return None
 
 
-def extract_result_address(result: Dict[str, Any]) -> str:
-    siege = result.get("siege") or {}
-
-    adresse = clean_str(siege.get("adresse"))
-    cp = clean_str(siege.get("code_postal"))
-    ville = clean_str(siege.get("libelle_commune")) or clean_str(siege.get("commune"))
-
-    if adresse or cp or ville:
-        return " ".join(x for x in [adresse, cp, ville] if x).strip()
-
-    return (
-        clean_str(result.get("adresse"))
-        or clean_str(result.get("adresse_complete"))
-        or clean_str(result.get("full_address"))
-    )
-
-
 def extract_company_name(result: Dict[str, Any]) -> str:
     return (
         clean_str(result.get("nom_complet"))
@@ -234,6 +217,34 @@ def extract_siret(result: Dict[str, Any]) -> str:
     return clean_str(get_nested(result, "siege", "siret")) or clean_str(result.get("siret"))
 
 
+def extract_result_address(result: Dict[str, Any]) -> str:
+    siege = result.get("siege") or {}
+
+    full_address = clean_str(siege.get("adresse"))
+    if full_address:
+        return full_address
+
+    street_parts = []
+    for key in ["numero_voie", "type_voie", "libelle_voie", "complement_adresse"]:
+        value = clean_str(siege.get(key))
+        if value:
+            street_parts.append(value)
+
+    street = " ".join(street_parts)
+    cp = clean_str(siege.get("code_postal"))
+    city = clean_str(siege.get("libelle_commune")) or clean_str(siege.get("commune"))
+
+    if street:
+        return " ".join(x for x in [street, cp, city] if x).strip()
+
+    fallback = (
+        clean_str(result.get("adresse"))
+        or clean_str(result.get("adresse_complete"))
+        or clean_str(result.get("full_address"))
+    )
+    return fallback
+
+
 def result_country_is_france(result: Dict[str, Any]) -> bool:
     siege = result.get("siege") or {}
     country = clean_str(siege.get("libelle_pays_etranger")) or clean_str(result.get("pays"))
@@ -242,26 +253,29 @@ def result_country_is_france(result: Dict[str, Any]) -> bool:
     return is_france_or_unspecified(country)
 
 
-def address_score(input_address: str, result_address: str) -> float:
-    input_norm = normalize_address(input_address)
-    result_norm = normalize_address(result_address)
+def address_score(source_addr: str, candidate_addr: str) -> float:
+    if not source_addr or not candidate_addr:
+        return 0.0
 
-    score = similarity(input_norm, result_norm)
+    source_norm = normalize_address(source_addr)
+    candidate_norm = normalize_address(candidate_addr)
 
-    input_cp, input_city = extract_cp_city(input_address)
-    result_cp, result_city = extract_cp_city(result_address)
+    score = similarity(source_norm, candidate_norm)
 
-    if input_cp and result_cp:
-        if input_cp == result_cp:
+    source_cp, source_city = extract_cp_city(source_addr)
+    candidate_cp, candidate_city = extract_cp_city(candidate_addr)
+
+    if source_cp and candidate_cp:
+        if source_cp == candidate_cp:
             score += 0.15
         else:
             score -= 0.25
 
-    if input_city and result_city:
-        city_sim = similarity(normalize_address(input_city), normalize_address(result_city))
-        if city_sim >= 0.9:
+    if source_city and candidate_city:
+        city_score = similarity(normalize_address(source_city), normalize_address(candidate_city))
+        if city_score >= 0.9:
             score += 0.10
-        elif city_sim < 0.5:
+        elif city_score < 0.5:
             score -= 0.10
 
     return max(0.0, min(score, 1.0))
@@ -271,7 +285,7 @@ def get_api_matches_for_row(row: pd.Series, client: RechercheEntrepriseClient, p
     if not is_france_or_unspecified(row.get("Pays")):
         return []
 
-    query = build_input_address(row)
+    query = search_query(row)
     if not query:
         return []
 
@@ -279,28 +293,26 @@ def get_api_matches_for_row(row: pd.Series, client: RechercheEntrepriseClient, p
     if not data:
         return []
 
-    results = data.get("results", []) or []
+    src_addr = source_address(row)
+    matches = []
 
-    output = []
-    for result in results:
+    for result in data.get("results", []) or []:
         if not result_country_is_france(result):
             continue
 
         siren = extract_siren(result)
-        siret = extract_siret(result)
         addr = extract_result_address(result)
 
-        output.append({
+        matches.append({
             "nom": extract_company_name(result),
             "adresse": addr,
             "siren": siren,
-            "siret": siret,
+            "siret": extract_siret(result),
             "intracom": compute_french_vat_from_siren(siren),
-            "score": address_score(query, addr),
-            "raw": result,
+            "score": address_score(src_addr, addr),
         })
 
-    return output
+    return matches
 
 
 def atomic_write_json(path: Path, data: dict) -> None:
@@ -323,17 +335,20 @@ def persist_progress(df: pd.DataFrame, current_idx: int) -> None:
 
 
 def load_progress() -> Tuple[Optional[pd.DataFrame], int]:
-    if AUTOSAVE_XLSX.exists():
-        df = pd.read_excel(AUTOSAVE_XLSX)
-        idx = 0
-        if AUTOSAVE_META.exists():
-            with open(AUTOSAVE_META, "r", encoding="utf-8") as f:
-                idx = int(json.load(f).get("current_idx", 0))
-        return df, idx
-    return None, 0
+    if not AUTOSAVE_XLSX.exists():
+        return None, 0
+
+    df = pd.read_excel(AUTOSAVE_XLSX)
+    idx = 0
+
+    if AUTOSAVE_META.exists():
+        with open(AUTOSAVE_META, "r", encoding="utf-8") as f:
+            idx = int(json.load(f).get("current_idx", 0))
+
+    return df, idx
 
 
-def reset_progress_files():
+def reset_progress_files() -> None:
     if AUTOSAVE_XLSX.exists():
         AUTOSAVE_XLSX.unlink()
     if AUTOSAVE_META.exists():
@@ -349,7 +364,7 @@ def ensure_enrichment_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def apply_match(df: pd.DataFrame, row_idx, row: pd.Series, match: Dict[str, Any]) -> None:
     df.at[row_idx, "api_match_status"] = "MATCHED"
-    df.at[row_idx, "api_query"] = build_input_address(row)
+    df.at[row_idx, "api_query"] = search_query(row)
     df.at[row_idx, "api_score_adresse"] = match.get("score")
     df.at[row_idx, "api_nom_reel"] = match.get("nom")
     df.at[row_idx, "api_adresse_trouvee"] = match.get("adresse")
@@ -362,7 +377,20 @@ def apply_match(df: pd.DataFrame, row_idx, row: pd.Series, match: Dict[str, Any]
 
 def apply_no_match(df: pd.DataFrame, row_idx, row: pd.Series) -> None:
     df.at[row_idx, "api_match_status"] = "NO_MATCH_SELECTED"
-    df.at[row_idx, "api_query"] = build_input_address(row)
+    df.at[row_idx, "api_query"] = search_query(row)
+    df.at[row_idx, "api_score_adresse"] = 0
+    df.at[row_idx, "api_nom_reel"] = None
+    df.at[row_idx, "api_adresse_trouvee"] = None
+    df.at[row_idx, "api_siren"] = None
+    df.at[row_idx, "api_siret"] = None
+    df.at[row_idx, "api_intracom"] = None
+    df.at[row_idx, "api_tel_1"] = clean_str(row.get("Tél")) or None
+    df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or None
+
+
+def mark_foreign_row(df: pd.DataFrame, row_idx, row: pd.Series) -> None:
+    df.at[row_idx, "api_match_status"] = "FOREIGN_NOT_SEARCHED"
+    df.at[row_idx, "api_query"] = None
     df.at[row_idx, "api_score_adresse"] = 0
     df.at[row_idx, "api_nom_reel"] = None
     df.at[row_idx, "api_adresse_trouvee"] = None
@@ -379,53 +407,54 @@ if "df_work" not in st.session_state:
 if "current_idx" not in st.session_state:
     st.session_state.current_idx = 0
 
-if "loaded_once" not in st.session_state:
-    st.session_state.loaded_once = False
-
 if "api_client" not in st.session_state:
     st.session_state.api_client = RechercheEntrepriseClient()
+
+if "matches_cache" not in st.session_state:
+    st.session_state.matches_cache = {}
+
+if "loaded_source_name" not in st.session_state:
+    st.session_state.loaded_source_name = None
 
 
 st.title("Validation manuelle des correspondances fournisseurs")
 
-top_col1, top_col2, top_col3 = st.columns([1.3, 1, 1])
+c1, c2, c3 = st.columns([1.4, 1, 1])
 
-with top_col1:
-    uploaded = st.file_uploader("Charge un Excel ou CSV", type=["xlsx", "csv"])
+with c1:
+    uploaded = st.file_uploader("Charge un fichier Excel ou CSV", type=["xlsx", "csv"])
+    if uploaded is not None and st.button("Charger ce fichier"):
+        if uploaded.name.lower().endswith(".csv"):
+            df_in = pd.read_csv(uploaded)
+        else:
+            df_in = pd.read_excel(uploaded)
 
-with top_col2:
+        st.session_state.df_work = ensure_enrichment_columns(df_in.copy(deep=True))
+        st.session_state.current_idx = 0
+        st.session_state.matches_cache = {}
+        st.session_state.loaded_source_name = uploaded.name
+        persist_progress(st.session_state.df_work, st.session_state.current_idx)
+        st.rerun()
+
+with c2:
     if st.button("Reprendre l'autosave"):
         df_saved, idx_saved = load_progress()
         if df_saved is not None:
             st.session_state.df_work = ensure_enrichment_columns(df_saved.copy(deep=True))
             st.session_state.current_idx = idx_saved
-            st.session_state.loaded_once = True
+            st.session_state.matches_cache = {}
             st.rerun()
         else:
             st.warning("Aucun autosave trouvé.")
 
-with top_col3:
+with c3:
     if st.button("Réinitialiser la reprise"):
         reset_progress_files()
         st.session_state.df_work = None
         st.session_state.current_idx = 0
-        st.session_state.loaded_once = False
+        st.session_state.matches_cache = {}
+        st.session_state.loaded_source_name = None
         st.rerun()
-
-
-if uploaded is not None and not st.session_state.loaded_once:
-    if uploaded.name.lower().endswith(".csv"):
-        df_in = pd.read_csv(uploaded)
-    else:
-        df_in = pd.read_excel(uploaded)
-
-    df_in = ensure_enrichment_columns(df_in.copy(deep=True))
-    st.session_state.df_work = df_in
-    st.session_state.current_idx = 0
-    st.session_state.loaded_once = True
-
-    persist_progress(st.session_state.df_work, st.session_state.current_idx)
-    st.rerun()
 
 
 df_work = st.session_state.df_work
@@ -434,15 +463,12 @@ if df_work is None:
     st.info("Charge un fichier ou reprends un autosave.")
     st.stop()
 
-
 total = len(df_work)
-current_idx = min(st.session_state.current_idx, max(total - 1, 0))
-
-done_count = int((df_work["api_match_status"].notna()).sum()) if "api_match_status" in df_work.columns else 0
+current_idx = st.session_state.current_idx
+done_count = int(df_work["api_match_status"].notna().sum())
 
 st.progress(done_count / total if total else 0.0)
 st.write(f"Traité : {done_count} / {total}")
-st.write(f"Position courante : {current_idx + 1} / {total}")
 
 if total == 0:
     st.warning("Le fichier est vide.")
@@ -451,15 +477,17 @@ if total == 0:
 if current_idx >= total:
     st.success("Tout est traité.")
 else:
+    st.write(f"Position courante : {current_idx + 1} / {total}")
+
     row = df_work.iloc[current_idx]
     row_idx = df_work.index[current_idx]
+    foreign_row = not is_france_or_unspecified(row.get("Pays"))
 
     left, right = st.columns([1, 1.35])
 
     with left:
         st.subheader("Informations du fichier")
-
-        source_info = {
+        st.json({
             "Numero": row.get("Numero"),
             "Intitulé": row.get("Intitulé"),
             "Clé": row.get("Clé"),
@@ -469,51 +497,67 @@ else:
             "Tél": row.get("Tél"),
             "Tél2": row.get("Tél2"),
             "Email": row.get("Email"),
-        }
-        st.json(source_info)
+        })
 
-        nav1, nav2, nav3 = st.columns(3)
+        n1, n2, n3 = st.columns(3)
 
-        with nav1:
+        with n1:
             if st.button("⬅️ Précédent", disabled=(current_idx == 0)):
                 st.session_state.current_idx -= 1
                 st.rerun()
 
-        with nav2:
-            if st.button("Aucune correspondance", type="primary"):
-                apply_no_match(df_work, row_idx, row)
-                next_idx = min(current_idx + 1, total)
-                st.session_state.current_idx = next_idx
-                persist_progress(df_work, st.session_state.current_idx)
-                st.rerun()
+        with n2:
+            if foreign_row:
+                if st.button("Marquer comme étranger", type="primary"):
+                    mark_foreign_row(df_work, row_idx, row)
+                    st.session_state.current_idx += 1
+                    persist_progress(df_work, st.session_state.current_idx)
+                    st.rerun()
+            else:
+                if st.button("Aucune correspondance", type="primary"):
+                    apply_no_match(df_work, row_idx, row)
+                    st.session_state.current_idx += 1
+                    persist_progress(df_work, st.session_state.current_idx)
+                    st.rerun()
 
-        with nav3:
+        with n3:
             if st.button("➡️ Suivant sans choisir", disabled=(current_idx >= total - 1)):
                 st.session_state.current_idx += 1
                 st.rerun()
 
     with right:
         st.subheader("Résultats API")
-        matches = get_api_matches_for_row(row, st.session_state.api_client, per_page=10)
 
-        if not matches:
-            st.warning("Aucun résultat API pour cette ligne.")
+        if foreign_row:
+            st.info("Pays étranger détecté : la ligne restera dans le fichier de sortie, mais aucune recherche API ne sera lancée.")
         else:
-            for i, match in enumerate(matches):
-                with st.container(border=True):
-                    st.markdown(f"**{match.get('nom') or ''}**")
-                    st.write(f"Adresse : {match.get('adresse') or ''}")
-                    st.write(f"SIREN : {match.get('siren') or ''}")
-                    st.write(f"SIRET : {match.get('siret') or ''}")
-                    st.write(f"Intracom : {match.get('intracom') or ''}")
-                    st.write(f"Proximité adresse : {match.get('score', 0):.4f}")
+            cache_key = f"{row_idx}|{search_query(row)}"
+            if cache_key not in st.session_state.matches_cache:
+                st.session_state.matches_cache[cache_key] = get_api_matches_for_row(
+                    row,
+                    st.session_state.api_client,
+                    per_page=10,
+                )
 
-                    if st.button(f"Choisir ce résultat #{i + 1}", key=f"pick_{current_idx}_{i}"):
-                        apply_match(df_work, row_idx, row, match)
-                        next_idx = min(current_idx + 1, total)
-                        st.session_state.current_idx = next_idx
-                        persist_progress(df_work, st.session_state.current_idx)
-                        st.rerun()
+            matches = st.session_state.matches_cache[cache_key]
+
+            if not matches:
+                st.warning("Aucun résultat API pour cette ligne.")
+            else:
+                for i, match in enumerate(matches):
+                    with st.container(border=True):
+                        st.markdown(f"**{match.get('nom') or ''}**")
+                        st.write(f"Adresse : {match.get('adresse') or ''}")
+                        st.write(f"SIREN : {match.get('siren') or ''}")
+                        st.write(f"SIRET : {match.get('siret') or ''}")
+                        st.write(f"Intracom : {match.get('intracom') or ''}")
+                        st.write(f"Proximité adresse : {match.get('score', 0):.4f}")
+
+                        if st.button(f"Choisir ce résultat #{i + 1}", key=f"pick_{current_idx}_{i}"):
+                            apply_match(df_work, row_idx, row, match)
+                            st.session_state.current_idx += 1
+                            persist_progress(df_work, st.session_state.current_idx)
+                            st.rerun()
 
 
 st.divider()
