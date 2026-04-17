@@ -141,12 +141,19 @@ def get_nested(data: Dict[str, Any], *keys, default=None):
     return current
 
 
-def normalize_siren(value: Any) -> str:
+def normalize_siret(value: Any) -> str:
     return re.sub(r"\D", "", clean_str(value))
 
 
+def siren_from_siret(value: Any) -> Optional[str]:
+    siret = normalize_siret(value)
+    if len(siret) != 14:
+        return None
+    return siret[:9]
+
+
 def compute_french_vat_from_siren(siren: str) -> Optional[str]:
-    siren = normalize_siren(siren)
+    siren = re.sub(r"\D", "", clean_str(siren))
     if len(siren) != 9:
         return None
     key = (12 + 3 * (int(siren) % 97)) % 97
@@ -320,21 +327,21 @@ def get_api_matches_for_row(row: pd.Series, client: RechercheEntrepriseClient, p
     return matches
 
 
-def get_company_by_siren(
-    siren: str,
+def get_company_by_siret(
+    siret: str,
     row: pd.Series,
     client: RechercheEntrepriseClient,
 ) -> Optional[Dict[str, Any]]:
-    siren = normalize_siren(siren)
-    if len(siren) != 9:
+    siret = normalize_siret(siret)
+    if len(siret) != 14:
         return None
 
-    data = client.search(siren, per_page=10, page=1)
+    data = client.search(siret, per_page=10, page=1)
     if not data:
         return None
 
     for result in data.get("results", []) or []:
-        if extract_siren(result) == siren:
+        if extract_siret(result) == siret:
             return build_match_from_result(result, row)
 
     return None
@@ -426,30 +433,31 @@ def mark_foreign_row(df: pd.DataFrame, row_idx, row: pd.Series) -> None:
     df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or None
 
 
-def apply_manual_siren(
+def apply_manual_siret(
     df: pd.DataFrame,
     row_idx,
     row: pd.Series,
-    manual_siren: str,
+    manual_siret: str,
     match: Optional[Dict[str, Any]],
 ) -> None:
-    siren = normalize_siren(manual_siren)
+    siret = normalize_siret(manual_siret)
+    siren = siren_from_siret(siret)
 
-    df.at[row_idx, "api_query"] = siren
+    df.at[row_idx, "api_query"] = siret
     df.at[row_idx, "api_tel_1"] = clean_str(row.get("Tél")) or None
     df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or None
 
     if match is None:
-        df.at[row_idx, "api_match_status"] = "MANUAL_SIREN_ONLY"
+        df.at[row_idx, "api_match_status"] = "MANUAL_SIRET_ONLY"
         df.at[row_idx, "api_score_adresse"] = 0
         df.at[row_idx, "api_nom_reel"] = None
         df.at[row_idx, "api_adresse_trouvee"] = None
-        df.at[row_idx, "api_siren"] = siren or None
-        df.at[row_idx, "api_siret"] = None
-        df.at[row_idx, "api_intracom"] = compute_french_vat_from_siren(siren)
+        df.at[row_idx, "api_siren"] = siren
+        df.at[row_idx, "api_siret"] = siret or None
+        df.at[row_idx, "api_intracom"] = compute_french_vat_from_siren(siren) if siren else None
         return
 
-    df.at[row_idx, "api_match_status"] = "MANUAL_SIREN_MATCHED"
+    df.at[row_idx, "api_match_status"] = "MANUAL_SIRET_MATCHED"
     df.at[row_idx, "api_score_adresse"] = match.get("score")
     df.at[row_idx, "api_nom_reel"] = match.get("nom")
     df.at[row_idx, "api_adresse_trouvee"] = match.get("adresse")
@@ -585,29 +593,29 @@ else:
         st.divider()
         st.subheader("Saisie manuelle")
 
-        manual_siren = st.text_input(
-            "SIREN manuel",
-            key=f"manual_siren_{row_idx}",
-            placeholder="123456789",
+        manual_siret = st.text_input(
+            "SIRET manuel",
+            key=f"manual_siret_{row_idx}",
+            placeholder="12345678901234",
         )
 
-        if st.button("Valider le SIREN manuel", use_container_width=True):
-            siren_value = normalize_siren(manual_siren)
+        if st.button("Valider le SIRET manuel", use_container_width=True):
+            siret_value = normalize_siret(manual_siret)
 
-            if len(siren_value) != 9:
-                st.error("Le SIREN doit contenir exactement 9 chiffres.")
+            if len(siret_value) != 14:
+                st.error("Le SIRET doit contenir exactement 14 chiffres.")
             else:
-                manual_match = get_company_by_siren(
-                    siren_value,
+                manual_match = get_company_by_siret(
+                    siret_value,
                     row,
                     st.session_state.api_client,
                 )
 
-                apply_manual_siren(
+                apply_manual_siret(
                     df_work,
                     row_idx,
                     row,
-                    siren_value,
+                    siret_value,
                     manual_match,
                 )
 
