@@ -141,8 +141,12 @@ def get_nested(data: Dict[str, Any], *keys, default=None):
     return current
 
 
+def normalize_siren(value: Any) -> str:
+    return re.sub(r"\D", "", clean_str(value))
+
+
 def compute_french_vat_from_siren(siren: str) -> Optional[str]:
-    siren = re.sub(r"\D", "", clean_str(siren))
+    siren = normalize_siren(siren)
     if len(siren) != 9:
         return None
     key = (12 + 3 * (int(siren) % 97)) % 97
@@ -237,12 +241,11 @@ def extract_result_address(result: Dict[str, Any]) -> str:
     if street:
         return " ".join(x for x in [street, cp, city] if x).strip()
 
-    fallback = (
+    return (
         clean_str(result.get("adresse"))
         or clean_str(result.get("adresse_complete"))
         or clean_str(result.get("full_address"))
     )
-    return fallback
 
 
 def result_country_is_france(result: Dict[str, Any]) -> bool:
@@ -281,6 +284,20 @@ def address_score(source_addr: str, candidate_addr: str) -> float:
     return max(0.0, min(score, 1.0))
 
 
+def build_match_from_result(result: Dict[str, Any], row: pd.Series) -> Dict[str, Any]:
+    siren = extract_siren(result)
+    adresse = extract_result_address(result)
+
+    return {
+        "nom": extract_company_name(result),
+        "adresse": adresse,
+        "siren": siren,
+        "siret": extract_siret(result),
+        "intracom": compute_french_vat_from_siren(siren),
+        "score": address_score(source_address(row), adresse),
+    }
+
+
 def get_api_matches_for_row(row: pd.Series, client: RechercheEntrepriseClient, per_page: int = 10) -> List[Dict[str, Any]]:
     if not is_france_or_unspecified(row.get("Pays")):
         return []
@@ -293,26 +310,34 @@ def get_api_matches_for_row(row: pd.Series, client: RechercheEntrepriseClient, p
     if not data:
         return []
 
-    src_addr = source_address(row)
     matches = []
 
     for result in data.get("results", []) or []:
         if not result_country_is_france(result):
             continue
-
-        siren = extract_siren(result)
-        addr = extract_result_address(result)
-
-        matches.append({
-            "nom": extract_company_name(result),
-            "adresse": addr,
-            "siren": siren,
-            "siret": extract_siret(result),
-            "intracom": compute_french_vat_from_siren(siren),
-            "score": address_score(src_addr, addr),
-        })
+        matches.append(build_match_from_result(result, row))
 
     return matches
+
+
+def get_company_by_siren(
+    siren: str,
+    row: pd.Series,
+    client: RechercheEntrepriseClient,
+) -> Optional[Dict[str, Any]]:
+    siren = normalize_siren(siren)
+    if len(siren) != 9:
+        return None
+
+    data = client.search(siren, per_page=10, page=1)
+    if not data:
+        return None
+
+    for result in data.get("results", []) or []:
+        if extract_siren(result) == siren:
+            return build_match_from_result(result, row)
+
+    return None
 
 
 def atomic_write_json(path: Path, data: dict) -> None:
@@ -399,6 +424,38 @@ def mark_foreign_row(df: pd.DataFrame, row_idx, row: pd.Series) -> None:
     df.at[row_idx, "api_intracom"] = None
     df.at[row_idx, "api_tel_1"] = clean_str(row.get("Tél")) or None
     df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or None
+
+
+def apply_manual_siren(
+    df: pd.DataFrame,
+    row_idx,
+    row: pd.Series,
+    manual_siren: str,
+    match: Optional[Dict[str, Any]],
+) -> None:
+    siren = normalize_siren(manual_siren)
+
+    df.at[row_idx, "api_query"] = siren
+    df.at[row_idx, "api_tel_1"] = clean_str(row.get("Tél")) or None
+    df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or None
+
+    if match is None:
+        df.at[row_idx, "api_match_status"] = "MANUAL_SIREN_ONLY"
+        df.at[row_idx, "api_score_adresse"] = 0
+        df.at[row_idx, "api_nom_reel"] = None
+        df.at[row_idx, "api_adresse_trouvee"] = None
+        df.at[row_idx, "api_siren"] = siren or None
+        df.at[row_idx, "api_siret"] = None
+        df.at[row_idx, "api_intracom"] = compute_french_vat_from_siren(siren)
+        return
+
+    df.at[row_idx, "api_match_status"] = "MANUAL_SIREN_MATCHED"
+    df.at[row_idx, "api_score_adresse"] = match.get("score")
+    df.at[row_idx, "api_nom_reel"] = match.get("nom")
+    df.at[row_idx, "api_adresse_trouvee"] = match.get("adresse")
+    df.at[row_idx, "api_siren"] = match.get("siren")
+    df.at[row_idx, "api_siret"] = match.get("siret")
+    df.at[row_idx, "api_intracom"] = match.get("intracom")
 
 
 if "df_work" not in st.session_state:
@@ -525,11 +582,44 @@ else:
                 st.session_state.current_idx += 1
                 st.rerun()
 
+        st.divider()
+        st.subheader("Saisie manuelle")
+
+        manual_siren = st.text_input(
+            "SIREN manuel",
+            key=f"manual_siren_{row_idx}",
+            placeholder="123456789",
+        )
+
+        if st.button("Valider le SIREN manuel", use_container_width=True):
+            siren_value = normalize_siren(manual_siren)
+
+            if len(siren_value) != 9:
+                st.error("Le SIREN doit contenir exactement 9 chiffres.")
+            else:
+                manual_match = get_company_by_siren(
+                    siren_value,
+                    row,
+                    st.session_state.api_client,
+                )
+
+                apply_manual_siren(
+                    df_work,
+                    row_idx,
+                    row,
+                    siren_value,
+                    manual_match,
+                )
+
+                st.session_state.current_idx += 1
+                persist_progress(df_work, st.session_state.current_idx)
+                st.rerun()
+
     with right:
         st.subheader("Résultats API")
 
         if foreign_row:
-            st.info("Pays étranger détecté : la ligne restera dans le fichier de sortie, mais aucune recherche API ne sera lancée.")
+            st.info("Pays étranger détecté : la ligne restera dans le fichier de sortie, mais aucune recherche automatique ne sera lancée.")
         else:
             cache_key = f"{row_idx}|{search_query(row)}"
             if cache_key not in st.session_state.matches_cache:
