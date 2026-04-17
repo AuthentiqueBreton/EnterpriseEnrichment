@@ -37,6 +37,30 @@ ENRICHMENT_COLUMNS = [
     "api_tel_2",
 ]
 
+STRING_ENRICHMENT_COLUMNS = [
+    "api_match_status",
+    "api_query",
+    "api_nom_reel",
+    "api_adresse_trouvee",
+    "api_siren",
+    "api_siret",
+    "api_intracom",
+    "api_tel_1",
+    "api_tel_2",
+]
+
+READ_DTYPES = {
+    "api_match_status": "string",
+    "api_query": "string",
+    "api_nom_reel": "string",
+    "api_adresse_trouvee": "string",
+    "api_siren": "string",
+    "api_siret": "string",
+    "api_intracom": "string",
+    "api_tel_1": "string",
+    "api_tel_2": "string",
+}
+
 ABBREVIATIONS = {
     "AVENUE": "AV",
     "BOULEVARD": "BD",
@@ -60,6 +84,8 @@ def is_nan(value: Any) -> bool:
 
 
 def clean_str(value: Any) -> str:
+    if value is pd.NA:
+        return ""
     if is_nan(value):
         return ""
     return str(value).strip()
@@ -379,11 +405,26 @@ def persist_progress(df: pd.DataFrame, current_idx: int) -> None:
     atomic_write_json(AUTOSAVE_META, {"current_idx": safe_idx})
 
 
+def ensure_enrichment_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for col in STRING_ENRICHMENT_COLUMNS:
+        if col not in df.columns:
+            df[col] = pd.Series(pd.NA, index=df.index, dtype="string")
+        else:
+            df[col] = df[col].astype("string")
+
+    if "api_score_adresse" not in df.columns:
+        df["api_score_adresse"] = pd.Series([pd.NA] * len(df), index=df.index, dtype="Float64")
+    else:
+        df["api_score_adresse"] = pd.to_numeric(df["api_score_adresse"], errors="coerce").astype("Float64")
+
+    return df
+
+
 def load_progress() -> Tuple[Optional[pd.DataFrame], int]:
     if not AUTOSAVE_XLSX.exists():
         return None, 0
 
-    df = pd.read_excel(AUTOSAVE_XLSX)
+    df = pd.read_excel(AUTOSAVE_XLSX, dtype=READ_DTYPES)
     df = ensure_enrichment_columns(df)
     resume_idx = get_resume_index(df)
 
@@ -407,50 +448,43 @@ def reset_progress_files() -> None:
         AUTOSAVE_META.unlink()
 
 
-def ensure_enrichment_columns(df: pd.DataFrame) -> pd.DataFrame:
-    for col in ENRICHMENT_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-    return df
-
-
 def apply_match(df: pd.DataFrame, row_idx, row: pd.Series, match: Dict[str, Any]) -> None:
     df.at[row_idx, "api_match_status"] = "MATCHED"
     df.at[row_idx, "api_query"] = search_query(row)
     df.at[row_idx, "api_score_adresse"] = match.get("score")
     df.at[row_idx, "api_nom_reel"] = match.get("nom")
     df.at[row_idx, "api_adresse_trouvee"] = match.get("adresse")
-    df.at[row_idx, "api_siren"] = match.get("siren")
-    df.at[row_idx, "api_siret"] = match.get("siret")
-    df.at[row_idx, "api_intracom"] = match.get("intracom")
-    df.at[row_idx, "api_tel_1"] = clean_str(row.get("Tél")) or None
-    df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or None
+    df.at[row_idx, "api_siren"] = clean_str(match.get("siren")) or pd.NA
+    df.at[row_idx, "api_siret"] = clean_str(match.get("siret")) or pd.NA
+    df.at[row_idx, "api_intracom"] = clean_str(match.get("intracom")) or pd.NA
+    df.at[row_idx, "api_tel_1"] = clean_str(row.get("Tél")) or pd.NA
+    df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or pd.NA
 
 
 def apply_no_match(df: pd.DataFrame, row_idx, row: pd.Series) -> None:
     df.at[row_idx, "api_match_status"] = "NO_MATCH_SELECTED"
     df.at[row_idx, "api_query"] = search_query(row)
     df.at[row_idx, "api_score_adresse"] = 0
-    df.at[row_idx, "api_nom_reel"] = None
-    df.at[row_idx, "api_adresse_trouvee"] = None
-    df.at[row_idx, "api_siren"] = None
-    df.at[row_idx, "api_siret"] = None
-    df.at[row_idx, "api_intracom"] = None
-    df.at[row_idx, "api_tel_1"] = clean_str(row.get("Tél")) or None
-    df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or None
+    df.at[row_idx, "api_nom_reel"] = pd.NA
+    df.at[row_idx, "api_adresse_trouvee"] = pd.NA
+    df.at[row_idx, "api_siren"] = pd.NA
+    df.at[row_idx, "api_siret"] = pd.NA
+    df.at[row_idx, "api_intracom"] = pd.NA
+    df.at[row_idx, "api_tel_1"] = clean_str(row.get("Tél")) or pd.NA
+    df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or pd.NA
 
 
 def mark_foreign_row(df: pd.DataFrame, row_idx, row: pd.Series) -> None:
     df.at[row_idx, "api_match_status"] = "FOREIGN_NOT_SEARCHED"
-    df.at[row_idx, "api_query"] = None
+    df.at[row_idx, "api_query"] = pd.NA
     df.at[row_idx, "api_score_adresse"] = 0
-    df.at[row_idx, "api_nom_reel"] = None
-    df.at[row_idx, "api_adresse_trouvee"] = None
-    df.at[row_idx, "api_siren"] = None
-    df.at[row_idx, "api_siret"] = None
-    df.at[row_idx, "api_intracom"] = None
-    df.at[row_idx, "api_tel_1"] = clean_str(row.get("Tél")) or None
-    df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or None
+    df.at[row_idx, "api_nom_reel"] = pd.NA
+    df.at[row_idx, "api_adresse_trouvee"] = pd.NA
+    df.at[row_idx, "api_siren"] = pd.NA
+    df.at[row_idx, "api_siret"] = pd.NA
+    df.at[row_idx, "api_intracom"] = pd.NA
+    df.at[row_idx, "api_tel_1"] = clean_str(row.get("Tél")) or pd.NA
+    df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or pd.NA
 
 
 def apply_manual_siret(
@@ -463,27 +497,27 @@ def apply_manual_siret(
     siret = normalize_siret(manual_siret)
     siren = siren_from_siret(siret)
 
-    df.at[row_idx, "api_query"] = siret
-    df.at[row_idx, "api_tel_1"] = clean_str(row.get("Tél")) or None
-    df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or None
+    df.at[row_idx, "api_query"] = siret or pd.NA
+    df.at[row_idx, "api_tel_1"] = clean_str(row.get("Tél")) or pd.NA
+    df.at[row_idx, "api_tel_2"] = clean_str(row.get("Tél2")) or pd.NA
 
     if match is None:
         df.at[row_idx, "api_match_status"] = "MANUAL_SIRET_ONLY"
         df.at[row_idx, "api_score_adresse"] = 0
-        df.at[row_idx, "api_nom_reel"] = None
-        df.at[row_idx, "api_adresse_trouvee"] = None
-        df.at[row_idx, "api_siren"] = siren
-        df.at[row_idx, "api_siret"] = siret or None
-        df.at[row_idx, "api_intracom"] = compute_french_vat_from_siren(siren) if siren else None
+        df.at[row_idx, "api_nom_reel"] = pd.NA
+        df.at[row_idx, "api_adresse_trouvee"] = pd.NA
+        df.at[row_idx, "api_siren"] = siren or pd.NA
+        df.at[row_idx, "api_siret"] = siret or pd.NA
+        df.at[row_idx, "api_intracom"] = compute_french_vat_from_siren(siren) if siren else pd.NA
         return
 
     df.at[row_idx, "api_match_status"] = "MANUAL_SIRET_MATCHED"
     df.at[row_idx, "api_score_adresse"] = match.get("score")
-    df.at[row_idx, "api_nom_reel"] = match.get("nom")
-    df.at[row_idx, "api_adresse_trouvee"] = match.get("adresse")
-    df.at[row_idx, "api_siren"] = match.get("siren")
-    df.at[row_idx, "api_siret"] = match.get("siret")
-    df.at[row_idx, "api_intracom"] = match.get("intracom")
+    df.at[row_idx, "api_nom_reel"] = match.get("nom") or pd.NA
+    df.at[row_idx, "api_adresse_trouvee"] = match.get("adresse") or pd.NA
+    df.at[row_idx, "api_siren"] = clean_str(match.get("siren")) or pd.NA
+    df.at[row_idx, "api_siret"] = clean_str(match.get("siret")) or pd.NA
+    df.at[row_idx, "api_intracom"] = clean_str(match.get("intracom")) or pd.NA
 
 
 if "df_work" not in st.session_state:
@@ -507,9 +541,9 @@ with c1:
     uploaded = st.file_uploader("Charge un fichier Excel ou CSV", type=["xlsx", "csv"])
     if uploaded is not None and st.button("Charger ce fichier"):
         if uploaded.name.lower().endswith(".csv"):
-            df_in = pd.read_csv(uploaded)
+            df_in = pd.read_csv(uploaded, dtype=READ_DTYPES)
         else:
-            df_in = pd.read_excel(uploaded)
+            df_in = pd.read_excel(uploaded, dtype=READ_DTYPES)
 
         df_in = ensure_enrichment_columns(df_in.copy(deep=True))
         resume_idx = get_resume_index(df_in)
