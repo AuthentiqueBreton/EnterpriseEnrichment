@@ -361,9 +361,22 @@ def atomic_write_excel(df: pd.DataFrame, path: Path) -> None:
     os.replace(tmp, path)
 
 
+def get_resume_index(df: pd.DataFrame) -> int:
+    if "api_match_status" not in df.columns:
+        return 0
+
+    pending = df.index[df["api_match_status"].isna()].tolist()
+    if not pending:
+        return len(df)
+
+    first_pending_label = pending[0]
+    return int(df.index.get_loc(first_pending_label))
+
+
 def persist_progress(df: pd.DataFrame, current_idx: int) -> None:
+    safe_idx = min(max(current_idx, 0), len(df))
     atomic_write_excel(df, AUTOSAVE_XLSX)
-    atomic_write_json(AUTOSAVE_META, {"current_idx": current_idx})
+    atomic_write_json(AUTOSAVE_META, {"current_idx": safe_idx})
 
 
 def load_progress() -> Tuple[Optional[pd.DataFrame], int]:
@@ -371,13 +384,20 @@ def load_progress() -> Tuple[Optional[pd.DataFrame], int]:
         return None, 0
 
     df = pd.read_excel(AUTOSAVE_XLSX)
-    idx = 0
+    df = ensure_enrichment_columns(df)
+    resume_idx = get_resume_index(df)
 
     if AUTOSAVE_META.exists():
-        with open(AUTOSAVE_META, "r", encoding="utf-8") as f:
-            idx = int(json.load(f).get("current_idx", 0))
+        try:
+            with open(AUTOSAVE_META, "r", encoding="utf-8") as f:
+                saved_idx = int(json.load(f).get("current_idx", 0))
+            if resume_idx < len(df):
+                return df, resume_idx
+            return df, min(saved_idx, len(df))
+        except Exception:
+            pass
 
-    return df, idx
+    return df, resume_idx
 
 
 def reset_progress_files() -> None:
@@ -478,9 +498,6 @@ if "api_client" not in st.session_state:
 if "matches_cache" not in st.session_state:
     st.session_state.matches_cache = {}
 
-if "loaded_source_name" not in st.session_state:
-    st.session_state.loaded_source_name = None
-
 
 st.title("Validation manuelle des correspondances fournisseurs")
 
@@ -494,10 +511,13 @@ with c1:
         else:
             df_in = pd.read_excel(uploaded)
 
-        st.session_state.df_work = ensure_enrichment_columns(df_in.copy(deep=True))
-        st.session_state.current_idx = 0
+        df_in = ensure_enrichment_columns(df_in.copy(deep=True))
+        resume_idx = get_resume_index(df_in)
+
+        st.session_state.df_work = df_in
+        st.session_state.current_idx = resume_idx
         st.session_state.matches_cache = {}
-        st.session_state.loaded_source_name = uploaded.name
+
         persist_progress(st.session_state.df_work, st.session_state.current_idx)
         st.rerun()
 
@@ -518,7 +538,6 @@ with c3:
         st.session_state.df_work = None
         st.session_state.current_idx = 0
         st.session_state.matches_cache = {}
-        st.session_state.loaded_source_name = None
         st.rerun()
 
 
